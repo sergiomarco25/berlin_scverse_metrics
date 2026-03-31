@@ -36,33 +36,6 @@ def metric_sparsity_gini(sdata, image_key, labels_key, protein):
     n = len(x)
     return (n + 1 - 2 * np.sum(np.cumsum(x)) / np.sum(x)) / n
 
-def metric_rel_sni(sdata, image_key, labels_key, protein, thresh=0.0):
-    """
-    Calculates the Relative Signal-to-Noise Integral (Rel_SNI).
-    
-    This metric measures the area between the cell intensity distribution curve 
-    and the background noise profile, normalized by the Otsu threshold. It 
-    quantifies how much "real" signal exists above the expected background noise.
-
-    Args:
-        sdata (SpatialData): The SpatialData object containing images and labels.
-        image_key (str): Key for the image data in sdata.
-        labels_key (str): Key for the segmentation masks (labels) in sdata.
-        protein (str): The specific channel/protein name to analyze.
-        thresh (float, optional): The intensity threshold (e.g., Otsu). 
-            Defaults to 0.0. If > 0, the result is normalized by this value.
-
-    Returns:
-        float: The normalized SNI value. Higher values indicate a stronger 
-            signal-to-noise separation.
-    """
-    df_cells, df_bg = get_processed_distributions(sdata, image_key, labels_key, protein, thresh)
-    
-    y_cell = df_cells['mean_intensity'].values
-    y_bg = np.interp(np.linspace(0, 100, len(df_cells)), df_bg['percentile'], df_bg['mean_intensity'])
-    
-    raw_area = np.trapz(y_cell - y_bg) / len(df_cells)
-    return raw_area / thresh if thresh > 0 else raw_area
 
 def metric_intracell_coverage(sdata, image_key, labels_key, protein, thresh=0.0):
     """
@@ -95,16 +68,27 @@ def get_protein_data(sdata, image_key, labels_key, protein):
     mask_data = sdata[labels_key].values.squeeze()
     return img_data, mask_data
 
-def get_processed_distributions(sdata, image_key, labels_key, protein, thresh=0.0):
-    """Extracts the dataframes needed for SNI and plotting."""
+
+import numpy as np
+import pandas as pd
+from scipy.ndimage import binary_dilation
+
+def get_processed_distributions(sdata, image_key, labels_key, protein, thresh=0.0, dilation_iterations=3):
+    """
+    Extracts distributions using locally proximal background sampling.
+    
+    Args:
+        dilation_iterations (int): How far to 'grow' the cell masks to find proximal background.
+    """
     img_data, mask_data = get_protein_data(sdata, image_key, labels_key, protein)
     
-    # Process Cells
+    # 1. Process Individual Cells
     unique_labels = np.unique(mask_data[mask_data > 0])
     results = []
     for label in unique_labels:
         pixels = img_data[mask_data == label]
         results.append({
+            'cell_id': label,
             'mean_intensity': np.mean(pixels),
             'prop_positive': np.mean(pixels > thresh) if thresh > 0 else 1.0
         })
@@ -112,12 +96,19 @@ def get_processed_distributions(sdata, image_key, labels_key, protein, thresh=0.
     df_cells = pd.DataFrame(results).sort_values('mean_intensity').reset_index(drop=True)
     df_cells['cell_rank_pct'] = (df_cells.index / len(df_cells)) * 100
     
-    # Process Background
-    bg_pixels = img_data[mask_data == 0]
-    avg_cell_size = int(np.sum(mask_data > 0) / len(df_cells)) if len(df_cells) > 0 else 100
+    # 2. Identify Locally Proximal Background
+    # Create a mask of pixels near cells but not inside cells
+    cell_mask = mask_data > 0
+    dilated_mask = binary_dilation(cell_mask, iterations=dilation_iterations)
+    proximal_bg_mask = dilated_mask & (~cell_mask)
+    bg_pixels = img_data[proximal_bg_mask]
+    
+    # 3. Create Pseudo-cells from Proximal Background
+    avg_cell_size = int(np.sum(cell_mask) / len(df_cells)) if len(df_cells) > 0 else 100
     num_samples = min(len(df_cells), len(bg_pixels) // avg_cell_size)
     
     if num_samples > 10:
+        # Group local background into cell-sized chunks
         bg_samples = np.random.choice(bg_pixels, (num_samples, avg_cell_size), replace=False)
         df_bg = pd.DataFrame({
             'mean_intensity': np.sort(np.mean(bg_samples, axis=1)),
@@ -128,3 +119,27 @@ def get_processed_distributions(sdata, image_key, labels_key, protein, thresh=0.
         df_bg = pd.DataFrame({'mean_intensity': [0.0], 'prop_positive': [0.0], 'percentile': [0.0]})
         
     return df_cells, df_bg
+
+def metric_rel_sni(sdata, image_key, labels_key, protein, thresh=0.0, norm_percentile=95):
+    """
+    Calculates Rel_SNI using locally proximal background and percentile normalization.
+
+    Args:
+        sdata: SpatialData object.
+        thresh: Threshold used for pixel-level prop_positive calculations.
+        norm_percentile: The percentile of cell intensities used to normalize the area.
+    """
+    df_cells, df_bg = get_processed_distributions(sdata, image_key, labels_key, protein, thresh)
+    
+    # Define the 'Reference Brightness' using the specified percentile of cell means
+    norm_factor = np.percentile(df_cells['mean_intensity'], norm_percentile)
+    
+    # Align Background to Cell Ranks
+    y_cell = df_cells['mean_intensity'].values
+    y_bg = np.interp(np.linspace(0, 100, len(df_cells)), df_bg['percentile'], df_bg['mean_intensity'])
+    
+    # Calculate the Signal Volume (Area)
+    raw_area = np.trapz(y_cell - y_bg) / len(df_cells)
+    
+    # Normalize the area by the chosen percentile
+    return raw_area / norm_factor if norm_factor > 0 else 0.0
